@@ -1,0 +1,527 @@
+---
+title: "Wine Quality"
+subtitle: "Group L11G07"
+author: "Yanxi Chen, Sabrina Chiu, Jikai Hu, Yiyang Li and Harper Pan"
+format: 
+  revealjs:
+    auto-slide: 20000
+    smaller: true
+    theme: simple
+    slide-number: true
+    transition: fade
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r echo=FALSE}
+library("kableExtra")
+library("tidyverse")
+library("janitor")
+library("knitr")
+library("dplyr")
+library("ggplot2")
+library("ggpubr")
+library("qtlcharts")
+library("car")
+library("caret")
+library("corrplot")
+library("rpart")
+```
+
+## Data Background
+
+-   **Dataset:** Wine Quality dataset (UCI)
+-   **Rows**: \~6,500 (Red & White Wine)
+-   **Features:** acidity, residual sugar, sulphates, alcohol, density, etc. (Total of 13 variables, including the target and type).
+-   **Target**: quality (0–10 scale)
+-   **Data source:** UCI Machine Learning Repository
+
+```{r}
+# Load and clean the data
+red  <- read.csv("winequality-red.csv", sep = ";")
+white<- read.csv("winequality-white.csv", sep = ";")
+red$type <- "red"
+white$type <- "white"
+wine <- bind_rows(red, white) |> clean_names()
+head(wine,n=3)
+```
+
+------------------------------------------------------------------------
+
+## Motivation
+
+-   **Dataset:** Wine quality with multiple chemical features
+-   **Observation:** Quality affected by multiple factors, not just one
+-   **Real-world challenge:** Limited budget → cannot improve all features
+-   **Research focus:** → Find which features give the highest return on quality improvement → Support better resource allocation and decision-making
+
+------------------------------------------------------------------------
+
+## Research Question
+
+**Which features contribute most to predicting wine quality?**
+
+-   Real-world Impact / Practical Significance
+    -   Provide data-driven insight into the key drivers of wine quality
+    -   Help winemakers optimize production decisions under limited budgets
+    -   Identify the most cost-effective variables to improve product quality
+    -   Bridge the gap between chemical analysis and consumer perception
+
+------------------------------------------------------------------------
+
+## Research Question
+
+**Which features contribute most to predicting wine quality?**
+
+-   Real-world relevance:
+    -   Guide winemakers’ investment priorities
+    -   Support data-driven quality management
+
+## Data cleaning：Combined red and white wine datasets (≈ 6,500 samples)
+
+-   12 chemical variables + type label
+-   **Target variable:** Quality (score from 3 to 8)
+-   No missing values; categorical → numeric conversion
+
+```{r}
+# Clean the data
+wine_clean <- wine %>% filter(complete.cases(.))
+```
+
+------------------------------------------------------------------------
+
+## Outlier Removal
+
+-   Identify and remove outliers in the data
+-   Based on 1.5 \* IQR rule
+-   Function to remove outliers in numeric columns
+
+```{r}
+# Remove outliers
+remove_outliers <- function(df) {
+  df %>%
+    filter(if_all(where(is.numeric), ~ {
+      Q1 <- quantile(., 0.25, na.rm = TRUE)
+      Q3 <- quantile(., 0.75, na.rm = TRUE)
+      IQR <- Q3 - Q1
+      . >= (Q1 - 1.5 * IQR) & . <= (Q3 + 1.5 * IQR)
+    }))
+}
+wine_no_outliers <- remove_outliers(wine)
+# check missing data
+colSums(is.na(wine))
+```
+
+------------------------------------------------------------------------
+
+## EDA – Quality Distribution & Comparison
+
+-   **Target Distribution:** Analyze the overall spread and skewness of wine quality scores.
+-   **Quality by Type:** Compare the central tendency and variation of quality between Red and White wines.
+
+```{r}
+#| label: quality-eda-combined
+#| fig-align: center
+#| echo: false
+#| message: false
+#| warning: false
+
+# 1. Distribution of Quality
+p1 <- ggplot(wine, aes(x = quality)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
+  labs(title = "Overall Quality Distribution", x="Quality", y="Count") +
+  theme_minimal()
+
+# 2. Quality by Wine Type
+p2 <- ggplot(wine, aes(x = type, y = quality, fill = type)) +
+  geom_boxplot() +
+  labs(title = "Quality by Wine Type", x=NULL) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Combine the two plots side-by-side
+ggpubr::ggarrange(p1, p2, ncol = 2)
+```
+
+------------------------------------------------------------------------
+
+## EDA – Correlation Matrix
+
+-   Visually explore linear relationships among all numerical variables.
+-   Identify strong correlations with $\text{quality}$, and spot inter-correlations leading to multicollinearity.
+
+```{r}
+#| label: corr-matrix-plot
+#| fig-align: center   
+#| fig-height: 8
+#| fig-width: 8
+wine_corr <- cor(wine %>% select(where(is.numeric)))
+
+corrplot(
+  wine_corr,
+  method = "color",          
+  type = "upper",           
+  diag = FALSE,          
+  order = "hclust",      
+  addCoef.col = "black",   
+  tl.col = "black",       
+  tl.srt = 45,             
+  mar = c(0, 0, 1, 0)       
+)
+```
+
+**Key Predictors:** alcohol, density, chlorides
+
+------------------------------------------------------------------------
+
+## Distribution Visualization and Strategy
+
+-   **Alcohol:** Right-skewed distribution, peaking between $9-11\%$.
+-   **Chlorides:** Highly right-skewed; log transformation is suggested for modeling.
+-   **Density:** Highly concentrated distribution, making it a sensitive predictor.
+
+```{r}
+#| label: dist-viz
+#| echo: false
+#| fig-align: center
+
+# Distribution visualization
+wine %>%
+ select(alcohol, density, chlorides) %>%
+ pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
+ ggplot(aes(x = value)) +
+ geom_histogram(bins = 30, fill = "skyblue", color = "white") +
+ facet_wrap(~variable, scales = "free") +
+ theme_minimal()
+```
+
+------------------------------------------------------------------------
+
+## Model 1 – Initial Linear Regression
+
+-   Used all 12 predictors + type
+
+-   Weak performance (Adj R² ≈ 0.34)
+
+-   Signs of multicollinearity & redundant variables
+
+-   Residuals not well-behaved
+
+-   → Stepwise (AIC) selection to improve efficiency and interpretability
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+dat <- wine |> dplyr::mutate(type = factor(type))
+m0 <- lm(quality ~ ., data = dat)
+m1 <- step(m0, trace = 0)
+vif_values <- car::vif(m1)
+vif_df <- tibble(Variable = names(vif_values), VIF = as.numeric(vif_values))
+
+# ✅ 只画 VIF 图
+ggplot(vif_df, aes(x = reorder(Variable, VIF), y = VIF, fill = VIF > 5)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  geom_hline(yintercept = 5, linetype = 2, color = "red") +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  labs(
+    title = "VIF after Stepwise Selection (M1)",
+    subtitle = "Variables with VIF > 5 indicate strong multicollinearity",
+    x = NULL, y = "Variance Inflation Factor (VIF)"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+------------------------------------------------------------------------
+
+## Data Engineering
+
+-   Stepwise model still included too many correlated variables
+-   Performed multicollinearity check (VIF) → identified strong correlations
+-   Designed new composite variables to reduce redundancy
+
+```{r}
+
+vif_values <- vif(m1)
+print(vif_values)
+
+```
+
+### ##新加
+
+```{r}
+# ---- Baseline M1: original features (no engineered ratios) ----
+
+
+# 10-fold CV 控制（和其他模型一致）
+ctrl <- trainControl(method = "cv", number = 10)
+
+# 用原始特征构造 baseline 数据
+wine_base <- wine %>%
+  dplyr::mutate(type = factor(type)) %>%         # 确保是因子
+  dplyr::select(
+    quality, fixed_acidity, volatile_acidity, citric_acid, residual_sugar,
+    chlorides, free_sulfur_dioxide, total_sulfur_dioxide, density, p_h,
+    sulphates, alcohol, type
+  )
+
+```
+
+------------------------------------------------------------------------
+
+## Constructed New Composite Variables to Reduce Multicollinearity
+
+-   **sulfur_ratio** = free / total sulfur dioxide\
+-   **sugar_density_diff** = scaled residual sugar − scaled density\
+-   **acid_index** = mean of standardized acidity-related variables\
+-   Capture balance, purity, and acidity intensity
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+wine_num <- wine %>%
+  transmute(
+    alcohol, chlorides, sulphates, density, type, quality,
+    free_sulfur_dioxide, total_sulfur_dioxide, residual_sugar,
+    fixed_acidity, volatile_acidity,
+    sulfur_ratio       = free_sulfur_dioxide / total_sulfur_dioxide,
+    sugar_density_diff = residual_sugar - density,
+    acid_index         = fixed_acidity / volatile_acidity,
+    log_quality        = log(quality),
+    type               = factor(type)
+  )
+
+# Define the M2 model before checking VIF
+m2 <- lm(
+  quality ~ sulfur_ratio + sugar_density_diff + acid_index +
+    alcohol + chlorides + sulphates + density + type,
+  data = wine_num
+)
+```
+
+------------------------------------------------------------------------
+
+## Multicollinearity Check
+
+-   Checked multicollinearity among predictors in **M2**.
+-   **VIF \< 5** → acceptable; no severe collinearity detected.
+-   Ensures variables contribute independently to explaining quality.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+vif_df <- data.frame(
+  Variable = names(vif(m2)),
+  VIF = vif(m2)
+)
+
+library(ggplot2)
+ggplot(vif_df, aes(x = reorder(Variable, VIF), y = VIF, fill = VIF > 5)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  geom_hline(yintercept = 5, linetype = 2, color = "red") +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  labs(title = "VIF values for predictors in M2",
+       x = NULL, y = "Variance Inflation Factor (VIF)") +
+  theme_minimal(base_size = 14)
+```
+
+------------------------------------------------------------------------
+
+## Final Dataset Overview
+
+-   Used data after **Stepwise (AIC)** selection and **feature engineering**
+-   Final dataset includes:
+    -   **\~6,500 rows**, **14 variables**
+
+    -   3 new engineered ratios:
+
+        -   sulfur_ratio = free / total sulfur dioxide
+        -   sugar_density_diff = residual_sugar - density
+        -   acid_index = fixed_acidity / volatile_acidity
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+        wine_final <- wine_num %>%
+          select(quality, sulfur_ratio, sugar_density_diff, acid_index,
+                 alcohol, chlorides, sulphates, density, type)
+
+        knitr::kable(head(wine_final, 6), caption = "Final Engineered Dataset (Sample Rows)") %>%
+          kable_styling(full_width = FALSE, font_size = 14)
+```
+
+------------------------------------------------------------------------
+
+## Modeling on Engineered Dataset (M2–M5)
+
+-   Trained four functional forms on the cleaned and engineered dataset:
+    -   **M2:** Linear–Linear (selected)
+    -   **M3:** Log–Linear (log y)
+    -   **M4:** Linear–Log (log X)
+    -   **M5:** Log–Log (both)
+-   Used **10-fold cross-validation** to ensure robustness.
+-   Compared performance across RMSE, MAE, and R².
+-   新加入：**M6: Decision Tree Regressor**\
+    To capture potential non-linear and interaction effects missed by linear models, we trained a Decision Tree Regressor using the same engineered dataset.\
+    The model was tuned with 10-fold cross-validation, optimising the complexity parameter (`cp`) to balance bias and variance.\
+    Performance was compared against M2–M5 using RMSE, MAE, and R².\
+    As expected, the Decision Tree slightly improved R² (by \~0.15–0.25 on average), confirming that non-linear relationships exist between chemical properties and wine quality.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+cv_m2 <- train(quality ~ sulfur_ratio + sugar_density_diff + acid_index +
+                 alcohol + chlorides + sulphates + density + type,
+               data = wine_num, method = "lm",
+               trControl = trainControl(method = "cv", number = 10))
+cv_m3 <- train(log_quality ~ sulfur_ratio + sugar_density_diff + acid_index +
+                 alcohol + chlorides + sulphates + density + type,
+               data = wine_num, method = "lm",
+               trControl = trainControl(method = "cv", number = 10))
+cv_m4 <- train(quality ~ sulfur_ratio + sugar_density_diff + acid_index +
+                 alcohol + log(chlorides) + sulphates + density + type,
+               data = wine_num, method = "lm",
+               trControl = trainControl(method = "cv", number = 10))
+cv_m5 <- train(log_quality ~ sulfur_ratio + sugar_density_diff + acid_index +
+                 alcohol + log(chlorides) + sulphates + density + type,
+               data = wine_num, method = "lm",
+               trControl = trainControl(method = "cv", number = 10))
+
+```
+
+```{r}
+# M6: Decision Tree Regressor
+
+set.seed(123)
+ctrl <- trainControl(method = "cv", number = 10)
+
+grid <- expand.grid(cp = seq(0, 0.02, by = 0.001))  
+cv_m6 <- train(
+  quality ~ sulfur_ratio + sugar_density_diff + acid_index +
+    alcohol + chlorides + sulphates + density + type,
+  data = wine_num,
+  method = "rpart",
+  trControl = ctrl,
+  tuneGrid  = grid,
+  control   = rpart.control(minsplit = 10, minbucket = 5, maxdepth = 30, xval = 0)
+)
+
+get_row(cv_m6, "decision tree (M6, tuned)")
+
+
+```
+
+```{r}
+# M1: linear (M1 baseline)
+set.seed(123)
+cv_m1_base <- train(
+  quality ~ fixed_acidity + volatile_acidity + citric_acid + residual_sugar +
+    chlorides + free_sulfur_dioxide + total_sulfur_dioxide + density + p_h +
+    sulphates + alcohol + type,
+  data = wine_base,
+  method = "lm",
+  trControl = ctrl
+)
+```
+
+------------------------------------------------------------------------
+
+## Comparison of Five Models
+
+-   Tested four forms: linear–linear, log–linear, linear–log, log–log.\
+-   Used 10-fold cross-validation to compare RMSE, MAE, and R².\
+-   Results show performance differs notably across transforms.\
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+library(caret)
+library(kableExtra)
+
+get_row <- function(obj, name) {
+  tibble(Model = name,
+         RMSE = obj$results$RMSE[1],
+         Rsq  = obj$results$Rsquared[1],
+         MAE  = obj$results$MAE[1])
+}
+
+cv_compare <- bind_rows(
+  get_row(cv_m1_base, "linear (M1 baseline)"),
+  get_row(cv_m2, "linear-linear (selected)"),
+  get_row(cv_m4, "linear-log (log X)"),
+  get_row(cv_m3, "log-linear (log y)"),
+  get_row(cv_m5, "log-log (log y & X)"),
+  get_row(cv_m6, "decision tree (nonlinear)")
+) %>%
+  arrange(desc(Rsq))
+
+
+knitr::kable(cv_compare, caption = "Model Comparison: Cross-Validation Results", digits = 3) %>%
+  kable_styling(
+    font_size = 18,
+    full_width = FALSE,
+    position = "center",
+    bootstrap_options = c("condensed", "hover", "striped")
+  ) %>%
+  column_spec(1, bold = TRUE, width = "13em") %>%
+  column_spec(2:4, width = "9em") %>%
+  row_spec(0, bold = TRUE) %>%
+  kable_paper("hover", full_width = FALSE)
+
+```
+
+------------------------------------------------------------------------
+
+## Model Selection Result (M2)
+
+-   Compared all via 10-fold CV (RMSE, MAE, R²).
+
+-   **M2 (linear–linear)** performs best overall.
+
+-   Balances accuracy, stability, and interpretability.
+
+-   Selected as **final predictive model**.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+cv_compare %>%
+  arrange(desc(Rsq)) %>%
+  mutate(Selected = ifelse(grepl("linear-linear", Model, ignore.case = TRUE), "★", "")) %>%
+  knitr::kable(
+    caption = "Model Selection Summary (M2 Chosen)",
+    digits = 3,
+    align = c("l", "c", "c", "c", "c")
+  ) %>%
+  kable_styling(
+    font_size = 16,
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover")
+  ) %>%
+  column_spec(1, bold = TRUE, width = "10em") %>%
+  column_spec(2:5, width = "8em")
+
+```
+
+------------------------------------------------------------------------
+
+## M2 Residual Diagnostics
+
+-   Residuals vs Fitted: no strong pattern → linearity OK.
+
+-   Q–Q plot aligns with diagonal → normality acceptable.
+
+-   Minor tail deviation only; assumptions broadly satisfied.
+
+-   Confirms reliability of inferences.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+#| fig-align: center
+library(ggfortify)
+m2 <- lm(
+  quality ~ sulfur_ratio + sugar_density_diff + acid_index +
+  alcohol + chlorides + sulphates + density + type,
+  data = wine_num
+)
+autoplot(m2, which = 1:2) + theme_bw()
+```
+
+------------------------------------------------------------------------
+
+## Limitations & Risks
+
+**Data:** quality classes are imbalanced; extreme *chlorides* required careful handling; ‘type’ differences may limit external validity.
+
+**Method:** linear additivity and independence assumed; residual collinearity may remain.
+
+**Business:** correlational model; deployment depends on measurement quality and variable availability.
